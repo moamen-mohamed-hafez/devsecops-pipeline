@@ -1,0 +1,637 @@
+# ============================================================
+# DevSecOps Pipeline — Full Security-Integrated CI/CD
+# Triggers on: Pull Requests + pushes to main
+#
+# Jobs:
+#   1. build        → Build Docker image
+#   2. test         → Run unit tests
+#   3. sast         → Snyk dependency + code scan
+#   4. container-scan → Trivy + Snyk container scan
+#   5. iac-scan     → tfsec Terraform scan
+#   6. dast         → OWASP ZAP dynamic scan
+#   7. security-report → Aggregate findings → PR comment
+#   8. gate         → Block merge on CRITICAL findings
+# ============================================================
+
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+# Cancel in-progress runs for the same PR (saves CI minutes)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: devsecops-demo
+  IMAGE_TAG: ${{ github.sha }}
+  REGISTRY: ghcr.io
+  FULL_IMAGE: ghcr.io/${{ github.repository_owner }}/devsecops-demo:${{ github.sha }}
+
+# ─────────────────────────────────────────────────────────────
+# JOB 1: Build
+# Builds the Docker image and pushes it to GitHub Container Registry
+# ─────────────────────────────────────────────────────────────
+jobs:
+  build:
+    name: 🏗️ Build Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # Needed to push to GHCR
+
+    outputs:
+      image: ${{ env.FULL_IMAGE }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # Auto-provided by GitHub Actions
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ env.FULL_IMAGE }}
+          # Cache layers between runs — speeds up builds significantly
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Build args for traceability
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            GIT_SHA=${{ github.sha }}
+
+      - name: Save image name for downstream jobs
+        run: echo "Built image ${{ env.FULL_IMAGE }}"
+
+  # ───────────────────────────────────────────────────────────
+  # JOB 2: Test
+  # Runs unit tests with coverage reporting
+  # ───────────────────────────────────────────────────────────
+  test:
+    name: 🧪 Unit Tests
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Run tests with coverage
+        working-directory: app
+        run: npm run test:ci
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()   # Upload even if tests fail
+        with:
+          name: coverage-report
+          path: app/coverage/
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────
+  # JOB 3: SAST — Static Application Security Testing
+  # Snyk scans source code and dependencies for known CVEs
+  # ───────────────────────────────────────────────────────────
+  sast:
+    name: 🔍 SAST — Snyk Dependency Scan
+    runs-on: ubuntu-latest
+    needs: build
+    # Don't fail the whole pipeline if Snyk is unavailable
+    continue-on-error: false
+    permissions:
+      contents: read
+      security-events: write   # Upload SARIF to GitHub Security tab
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Run Snyk dependency scan
+        uses: snyk/actions/node@master
+        env:
+          # SNYK_TOKEN must be set in GitHub repository secrets
+          # How to get it: snyk.io → Account Settings → API Token
+          # Where to set it: GitHub repo → Settings → Secrets → Actions → New secret
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: >
+            --severity-threshold=high
+            --file=app/package.json
+            --sarif-file-output=snyk-sast.sarif
+        # continue-on-error: true  ← Uncomment during initial setup to see results
+        # without failing. Remove once you've addressed findings.
+
+      - name: Upload Snyk SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: snyk-sast.sarif
+          category: snyk-sast
+
+      - name: Upload Snyk results as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: snyk-sast-results
+          path: snyk-sast.sarif
+          retention-days: 30
+
+  # ───────────────────────────────────────────────────────────
+  # JOB 4: Container Scan
+  # Trivy scans the Docker image for OS + library vulnerabilities
+  # Snyk also scans the container for additional coverage
+  # ───────────────────────────────────────────────────────────
+  container-scan:
+    name: 🐳 Container Scan — Trivy + Snyk
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      security-events: write
+      packages: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image for scanning
+        run: docker pull ${{ env.FULL_IMAGE }}
+
+      # ── Trivy scan ──────────────────────────────────────────
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.FULL_IMAGE }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          # CRITICAL: pipeline fails if CRITICAL vulnerabilities found
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+          # Ignore unfixed vulnerabilities (no patch available yet)
+          ignore-unfixed: true
+          # Timeout for large images
+          timeout: '10m'
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-container
+
+      # ── Trivy JSON output (for PR comment aggregation) ──────
+      - name: Run Trivy — JSON output for report
+        uses: aquasecurity/trivy-action@master
+        if: always()
+        with:
+          image-ref: ${{ env.FULL_IMAGE }}
+          format: 'json'
+          output: 'trivy-results.json'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          ignore-unfixed: true
+          exit-code: '0'   # Don't fail here — we already failed above
+
+      - name: Upload Trivy results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-results
+          path: |
+            trivy-results.sarif
+            trivy-results.json
+          retention-days: 30
+
+      # ── Snyk container scan ─────────────────────────────────
+      - name: Run Snyk container scan
+        uses: snyk/actions/docker@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: ${{ env.FULL_IMAGE }}
+          args: >
+            --severity-threshold=high
+            --sarif-file-output=snyk-container.sarif
+        continue-on-error: true   # Trivy is primary — Snyk is secondary coverage
+
+      - name: Upload Snyk container SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: snyk-container.sarif
+          category: snyk-container
+
+      # ── Docker Scout (Bonus) ────────────────────────────────
+      - name: Docker Scout — CVE scan
+        uses: docker/scout-action@v1
+        if: always()
+        with:
+          command: cves
+          image: ${{ env.FULL_IMAGE }}
+          only-severities: critical,high
+          exit-code: false   # Informational only — don't fail on Scout
+          summary: true
+        continue-on-error: true
+
+  # ───────────────────────────────────────────────────────────
+  # JOB 5: IaC Scan
+  # tfsec scans Terraform files for misconfigurations
+  # e.g. S3 bucket without encryption, security groups open to 0.0.0.0/0
+  # ───────────────────────────────────────────────────────────
+  iac-scan:
+    name: 🏗️ IaC Scan — tfsec
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write   # For PR annotations
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working_directory: terraform/
+          format: sarif
+          sarif_file: tfsec-results.sarif
+          # Fail on HIGH and CRITICAL severity
+          minimum_severity: HIGH
+          # Add annotations directly on the PR diff
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          soft_fail: false
+
+      - name: Upload tfsec SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: tfsec-results.sarif
+          category: tfsec
+
+      # Also run tfsec for human-readable JSON output
+      - name: Run tfsec — JSON output for report
+        uses: aquasecurity/tfsec-action@v1.0.0
+        if: always()
+        with:
+          working_directory: terraform/
+          format: json
+          sarif_file: tfsec-results.json
+          minimum_severity: MEDIUM
+          soft_fail: true
+
+      - name: Upload tfsec results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tfsec-results
+          path: |
+            tfsec-results.sarif
+            tfsec-results.json
+          retention-days: 30
+
+  # ───────────────────────────────────────────────────────────
+  # JOB 6: DAST — Dynamic Application Security Testing
+  # OWASP ZAP runs against the live running application
+  # It actually sends HTTP requests and looks for vulnerabilities:
+  # XSS, SQL injection, missing security headers, etc.
+  # ───────────────────────────────────────────────────────────
+  dast:
+    name: 🕷️ DAST — OWASP ZAP Scan
+    runs-on: ubuntu-latest
+    needs: [build, test]
+    permissions:
+      contents: read
+      issues: write   # ZAP action creates GitHub issues for findings
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Start the app so ZAP has something to scan
+      - name: Start application container
+        run: |
+          docker run -d \
+            --name app \
+            --network host \
+            -e PORT=3000 \
+            ${{ env.FULL_IMAGE }}
+
+          # Wait for app to be healthy before starting ZAP
+          echo "Waiting for app to be ready..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
+              echo "App is ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+          # Final check — fail if app didn't start
+          curl -sf http://localhost:3000/health || (echo "App failed to start!" && exit 1)
+
+      # ── ZAP Baseline Scan ───────────────────────────────────
+      # Baseline = passive scan only (no active attacks)
+      # Good for CI/CD — fast, no risk of breaking the app
+      # Use 'full-scan' for deeper testing in non-prod environments
+      - name: Run OWASP ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: 'http://localhost:3000'
+          # ZAP rules configuration file (we create this below)
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'    # -a = include alpha passive scan rules
+          # Don't fail on warnings — only fail on FAIL rules
+          fail_action: true
+          allow_issue_writing: false   # Don't create GitHub Issues for each finding
+          artifact_name: zap-report
+
+      - name: Upload ZAP report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-report
+          path: |
+            report_html.html
+            report_json.json
+          retention-days: 30
+
+      - name: Stop application container
+        if: always()
+        run: docker stop app && docker rm app || true
+
+  # ───────────────────────────────────────────────────────────
+  # JOB 7: Security Report
+  # Aggregates all scan results and posts a PR comment
+  # ───────────────────────────────────────────────────────────
+  security-report:
+    name: 📊 Security Report — PR Comment
+    runs-on: ubuntu-latest
+    needs: [sast, container-scan, iac-scan, dast]
+    if: always() && github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Parse scan results and post PR comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // ── Helper: parse Trivy JSON ──────────────────────
+            function parseTrivyResults() {
+              try {
+                const raw = fs.readFileSync('artifacts/trivy-results/trivy-results.json', 'utf8');
+                const data = JSON.parse(raw);
+                let critical = 0, high = 0, medium = 0;
+                (data.Results || []).forEach(r => {
+                  (r.Vulnerabilities || []).forEach(v => {
+                    if (v.Severity === 'CRITICAL') critical++;
+                    else if (v.Severity === 'HIGH') high++;
+                    else if (v.Severity === 'MEDIUM') medium++;
+                  });
+                });
+                return { critical, high, medium, status: critical > 0 ? 'FAIL' : 'PASS' };
+              } catch (e) {
+                return { critical: 0, high: 0, medium: 0, status: 'UNKNOWN', error: e.message };
+              }
+            }
+
+            // ── Helper: parse SARIF for finding counts ────────
+            function parseSarif(filepath) {
+              try {
+                const raw = fs.readFileSync(filepath, 'utf8');
+                const data = JSON.parse(raw);
+                let total = 0;
+                (data.runs || []).forEach(run => {
+                  total += (run.results || []).length;
+                });
+                return { total, status: total > 0 ? 'FINDINGS' : 'CLEAN' };
+              } catch (e) {
+                return { total: 0, status: 'UNKNOWN' };
+              }
+            }
+
+            // ── Collect results ───────────────────────────────
+            const trivy = parseTrivyResults();
+            const snykSast = parseSarif('artifacts/snyk-sast-results/snyk-sast.sarif');
+            const tfsec = parseSarif('artifacts/tfsec-results/tfsec-results.sarif');
+
+            // ── Job status from context ───────────────────────
+            const jobs = {
+              sast:      '${{ needs.sast.result }}',
+              container: '${{ needs.container-scan.result }}',
+              iac:       '${{ needs.iac-scan.result }}',
+              dast:      '${{ needs.dast.result }}'
+            };
+
+            const statusIcon = (s) => s === 'success' ? '✅' : s === 'failure' ? '❌' : '⚠️';
+            const sevIcon = (n) => n > 0 ? '🔴' : '✅';
+
+            // ── Build PR comment ──────────────────────────────
+            const body = `
+            ## 🔒 DevSecOps Security Scan Report
+
+            > Commit: \`${{ github.sha }}\` | Branch: \`${{ github.head_ref }}\`
+
+            ### Pipeline Status
+
+            | Stage | Tool | Status |
+            |-------|------|--------|
+            | SAST | Snyk | ${statusIcon(jobs.sast)} ${jobs.sast} |
+            | Container Scan | Trivy | ${statusIcon(jobs.container)} ${jobs.container} |
+            | IaC Scan | tfsec | ${statusIcon(jobs.iac)} ${jobs.iac} |
+            | DAST | OWASP ZAP | ${statusIcon(jobs.dast)} ${jobs.dast} |
+
+            ---
+
+            ### 🐳 Container Vulnerabilities (Trivy)
+
+            | Severity | Count | Gate |
+            |----------|-------|------|
+            | 🔴 Critical | ${trivy.critical} | ${trivy.critical > 0 ? '❌ BLOCKED' : '✅ PASS'} |
+            | 🟠 High | ${trivy.high} | ${trivy.high > 5 ? '⚠️ REVIEW' : '✅ PASS'} |
+            | 🟡 Medium | ${trivy.medium} | ℹ️ INFO |
+
+            ### 🔍 SAST Findings (Snyk)
+
+            | Tool | Findings | Status |
+            |------|----------|--------|
+            | Snyk Dependencies | ${snykSast.total} | ${snykSast.total > 0 ? '⚠️ Review required' : '✅ Clean'} |
+
+            ### 🏗️ IaC Findings (tfsec)
+
+            | Tool | Findings | Status |
+            |------|----------|--------|
+            | tfsec | ${tfsec.total} | ${tfsec.total > 0 ? '⚠️ Review required' : '✅ Clean'} |
+
+            ---
+
+            ### ${trivy.critical > 0 ? '❌ MERGE BLOCKED' : '✅ SECURITY GATE PASSED'}
+
+            ${trivy.critical > 0
+              ? `**This PR cannot be merged.** ${trivy.critical} CRITICAL vulnerabilities found in the container image.\nFix all CRITICAL findings and re-run the pipeline.`
+              : '**All security gates passed.** No critical vulnerabilities detected.'
+            }
+
+            <details>
+            <summary>📋 How to fix findings</summary>
+
+            **Trivy (container):** \`trivy image --severity CRITICAL <image>\`
+            **Snyk (code):** \`snyk test --severity-threshold=high\`
+            **tfsec (IaC):** \`tfsec terraform/ --minimum-severity HIGH\`
+            **ZAP (DAST):** Check the uploaded HTML report artifact
+
+            </details>
+
+            ---
+            *Generated by DevSecOps Pipeline • [View full scan results in Security tab](https://github.com/${{ github.repository }}/security)*
+            `;
+
+            // ── Find existing bot comment and update it ───────
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('DevSecOps Security Scan Report')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body,
+              });
+              console.log('Updated existing security comment');
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+              console.log('Created new security comment');
+            }
+
+  # ───────────────────────────────────────────────────────────
+  # JOB 8: Security Gate
+  # Final gate — fails the pipeline if critical issues exist
+  # Branch protection rules reference this job
+  # ───────────────────────────────────────────────────────────
+  gate:
+    name: 🚦 Security Gate
+    runs-on: ubuntu-latest
+    needs: [sast, container-scan, iac-scan, dast]
+    if: always()
+
+    steps:
+      - name: Evaluate security gate
+        run: |
+          echo "=== Security Gate Evaluation ==="
+          echo "SAST result:      ${{ needs.sast.result }}"
+          echo "Container result: ${{ needs.container-scan.result }}"
+          echo "IaC result:       ${{ needs.iac-scan.result }}"
+          echo "DAST result:      ${{ needs.dast.result }}"
+
+          FAILED=false
+
+          if [[ "${{ needs.container-scan.result }}" == "failure" ]]; then
+            echo "❌ BLOCKED: Container scan failed — CRITICAL vulnerabilities in image"
+            FAILED=true
+          fi
+
+          if [[ "${{ needs.sast.result }}" == "failure" ]]; then
+            echo "❌ BLOCKED: SAST failed — HIGH/CRITICAL vulnerabilities in dependencies"
+            FAILED=true
+          fi
+
+          # IaC and DAST are advisory — they warn but don't hard-block
+          if [[ "${{ needs.iac-scan.result }}" == "failure" ]]; then
+            echo "⚠️  WARNING: IaC scan found HIGH severity Terraform misconfigurations"
+          fi
+
+          if [[ "${{ needs.dast.result }}" == "failure" ]]; then
+            echo "⚠️  WARNING: DAST scan found vulnerabilities in running application"
+          fi
+
+          if [[ "$FAILED" == "true" ]]; then
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  ❌ SECURITY GATE FAILED — MERGE BLOCKED"
+            echo "  Fix all CRITICAL/HIGH vulnerabilities"
+            echo "  and re-run the pipeline."
+            echo "════════════════════════════════════════"
+            exit 1
+          else
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  ✅ SECURITY GATE PASSED"
+            echo "  Safe to merge."
+            echo "════════════════════════════════════════"
+          fi

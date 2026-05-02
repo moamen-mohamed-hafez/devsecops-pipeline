@@ -1,0 +1,69 @@
+# ============================================================
+# docker-compose.yml — Local development + security testing
+# Usage:
+#   docker-compose up           → start the app
+#   docker-compose up zap       → run ZAP scan against the app
+# ============================================================
+
+version: '3.8'
+
+services:
+
+  # ── Application ────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: devsecops-demo-app
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - APP_VERSION=1.0.0-local
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    # Security: read-only root filesystem
+    read_only: true
+    # Allow writes only to these directories
+    tmpfs:
+      - /tmp
+    # Drop ALL Linux capabilities, add back only what's needed
+    cap_drop:
+      - ALL
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    # Don't run as root
+    user: "1001:1001"
+
+  # ── OWASP ZAP DAST scanner ─────────────────────────────────
+  # Usage: docker-compose run zap
+  zap:
+    image: ghcr.io/zaproxy/zaproxy:stable
+    container_name: devsecops-zap
+    depends_on:
+      app:
+        condition: service_healthy
+    volumes:
+      - ./security-reports:/zap/wrk:rw
+      - ./.zap:/zap/rules:ro
+    command: >
+      zap-baseline.py
+      -t http://app:3000
+      -r zap-local-report.html
+      -J zap-local-report.json
+      -I
+    profiles:
+      - scanning    # Only runs when explicitly requested
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge

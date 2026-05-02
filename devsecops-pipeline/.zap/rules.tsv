@@ -1,0 +1,84 @@
+# ============================================================
+# OWASP ZAP Rules Configuration
+# Controls how ZAP handles each alert type:
+#   PASS  = ignore this finding (not applicable to our app)
+#   WARN  = report it but don't fail the pipeline
+#   FAIL  = fail the pipeline (critical issues)
+#
+# Format: rule_id  action  parameter
+# Full rule list: https://www.zaproxy.org/docs/alerts/
+# ============================================================
+
+# ── Rules set to WARN (report but don't fail) ─────────────────
+# 10015 - Incomplete or No Cache-control Header (acceptable for API)
+10015	WARN	(Incomplete or No Cache-control Header)
+
+# 10096 - Timestamp Disclosure (low risk for public APIs)
+10096	WARN	(Timestamp Disclosure - Unix)
+
+# 90005 - Sec-Fetch-Dest Header is Missing (browser-only header)
+90005	WARN	(Sec-Fetch-Dest Header is Missing)
+
+# ── Rules set to FAIL (hard block) ────────────────────────────
+# 10202 - Absence of Anti-CSRF Tokens (critical for forms)
+10202	FAIL	(Absence of Anti-CSRF Tokens)
+
+# 10010 - Cookie No HttpOnly Flag
+10010	FAIL	(Cookie No HttpOnly Flag)
+
+# 10011 - Cookie Without Secure Flag
+10011	FAIL	(Cookie Without Secure Flag)
+
+# 10016 - Web Browser XSS Protection Not Enabled
+10016	FAIL	(Web Browser XSS Protection Not Enabled)
+
+# 10017 - Cross-Domain JavaScript Source File Inclusion
+10017	FAIL	(Cross-Domain JavaScript Source File Inclusion)
+
+# 10019 - Content-Type Header Missing
+10019	FAIL	(Content-Type Header Missing)
+
+# 10021 - X-Content-Type-Options Header Missing
+10021	FAIL	(X-Content-Type-Options Header Missing)
+
+# 10023 - Information Disclosure - Debug Error Messages
+10023	FAIL	(Information Disclosure - Debug Error Messages)
+
+# 10024 - Information Disclosure - Sensitive Information in URL
+10024	FAIL	(Information Disclosure - Sensitive Information in URL)
+
+# 10025 - Information Disclosure - Sensitive Information in HTTP Referrer Header
+10025	FAIL	(Information Disclosure - Sensitive Information in HTTP Referrer Header)
+
+# 10038 - Content Security Policy (CSP) Header Not Set
+10038	FAIL	(Content Security Policy (CSP) Header Not Set)
+
+# 10040 - Secure Pages Include Mixed Content
+10040	FAIL	(Secure Pages Include Mixed Content)
+
+# 10055 - CSP: Wildcard Directive
+10055	WARN	(CSP: Wildcard Directive)
+
+# 10063 - Permissions Policy Header Not Set
+10063	WARN	(Permissions Policy Header Not Set)
+
+# 10096 - Sensitive Information in URL
+10096	FAIL	(Sensitive Information in URL)
+
+# 40012 - Cross Site Scripting (Reflected)
+40012	FAIL	(Cross Site Scripting (Reflected))
+
+# 40014 - Cross Site Scripting (Persistent)
+40014	FAIL	(Cross Site Scripting (Persistent))
+
+# 40018 - SQL Injection
+40018	FAIL	(SQL Injection)
+
+# 40019 - SQL Injection - MySQL
+40019	FAIL	(SQL Injection - MySQL)
+
+# 90019 - Server Side Code Injection
+90019	FAIL	(Server Side Code Injection)
+
+# 90020 - Remote OS Command Injection
+90020	FAIL	(Remote OS Command Injection)

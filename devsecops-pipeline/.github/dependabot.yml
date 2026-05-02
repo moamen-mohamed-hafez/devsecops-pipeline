@@ -1,0 +1,103 @@
+# ============================================================
+# Dependabot Configuration
+# Automatically opens PRs to update outdated/vulnerable deps
+#
+# How it works:
+#   1. Dependabot scans your dependency files daily/weekly
+#   2. If it finds an outdated or vulnerable package, it opens
+#      a PR with the fix already applied
+#   3. Your DevSecOps pipeline runs on that PR automatically
+#   4. If all security gates pass, you merge it
+#
+# This means security patches happen automatically — you don't
+# need to manually track CVE announcements.
+# ============================================================
+
+version: 2
+
+updates:
+
+  # ── Node.js dependencies ───────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/app"           # Where package.json lives
+    schedule:
+      interval: "weekly"        # Every Monday morning
+      day: "monday"
+      time: "06:00"
+      timezone: "Africa/Cairo"
+    open-pull-requests-limit: 10
+    # Auto-assign reviewers
+    reviewers:
+      - "Iamoamen"
+    labels:
+      - "dependencies"
+      - "security"
+      - "automated"
+    # Group all patch updates into one PR (less noise)
+    groups:
+      patch-updates:
+        update-types:
+          - "patch"
+      minor-updates:
+        update-types:
+          - "minor"
+    # Commit message format
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    # Ignore major version bumps (breaking changes) — handle manually
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # ── Docker base image ──────────────────────────────────────
+  - package-ecosystem: "docker"
+    directory: "/"              # Where Dockerfile lives
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Africa/Cairo"
+    reviewers:
+      - "Iamoamen"
+    labels:
+      - "dependencies"
+      - "docker"
+      - "security"
+    commit-message:
+      prefix: "chore(docker)"
+
+  # ── GitHub Actions ─────────────────────────────────────────
+  # Keeps action versions up to date (security — pinned versions
+  # can become vulnerable if the action repo is compromised)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Africa/Cairo"
+    reviewers:
+      - "Iamoamen"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "chore(actions)"
+
+  # ── Terraform providers ────────────────────────────────────
+  - package-ecosystem: "terraform"
+    directory: "/terraform"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "06:00"
+      timezone: "Africa/Cairo"
+    reviewers:
+      - "Iamoamen"
+    labels:
+      - "dependencies"
+      - "terraform"
+      - "infrastructure"
+    commit-message:
+      prefix: "chore(terraform)"

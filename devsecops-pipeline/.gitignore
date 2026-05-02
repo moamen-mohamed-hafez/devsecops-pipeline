@@ -1,0 +1,43 @@
+# Dependencies
+app/node_modules/
+node_modules/
+
+# Test output
+app/coverage/
+*.lcov
+
+# Security reports (local runs — don't commit)
+security-reports/local-*/
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/.terraform.lock.hcl
+terraform/terraform.tfvars    # May contain secrets
+
+# Environment files
+.env
+.env.*
+*.secret
+
+# Docker
+*.tar
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ZAP output (committed only the rules config, not scan output)
+report_html.html
+report_json.json
+zap_out.json
+
+# npm
+package-lock.json.backup

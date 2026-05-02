@@ -1,0 +1,139 @@
+# ============================================================
+# Terraform — SECURE version (after tfsec fixes)
+# This is what main.tf should look like after fixing all findings
+# ============================================================
+
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+variable "aws_region" {
+  type    = string
+  default = "eu-west-1"
+}
+
+variable "app_name" {
+  type    = string
+  default = "devsecops-demo"
+}
+
+variable "allowed_cidr" {
+  description = "CIDR block allowed to SSH — use your office/VPN IP"
+  type        = string
+  # Set this via tfvars or env var — never hardcode
+}
+
+# ── KMS key for encryption ────────────────────────────────────
+resource "aws_kms_key" "app_key" {
+  description             = "KMS key for ${var.app_name}"
+  deletion_window_in_days = 10
+  enable_key_rotation     = true   # ✅ Rotate keys automatically
+}
+
+# ── S3 bucket — SECURE ────────────────────────────────────────
+resource "aws_s3_bucket" "app_bucket" {
+  bucket = "${var.app_name}-storage"
+}
+
+# ✅ FIX 1: Enable encryption
+resource "aws_s3_bucket_server_side_encryption_configuration" "app_bucket" {
+  bucket = aws_s3_bucket.app_bucket.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.app_key.arn
+    }
+  }
+}
+
+# ✅ FIX 2: Enable versioning
+resource "aws_s3_bucket_versioning" "app_bucket" {
+  bucket = aws_s3_bucket.app_bucket.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# ✅ FIX 3: Block all public access
+resource "aws_s3_bucket_public_access_block" "app_bucket" {
+  bucket                  = aws_s3_bucket.app_bucket.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# ── Security group — SECURE ───────────────────────────────────
+resource "aws_security_group" "app_sg" {
+  name        = "${var.app_name}-sg"
+  description = "Security group for ${var.app_name}"
+
+  # ✅ FIX 4: Restrict SSH to known CIDR only
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.allowed_cidr]
+    description = "SSH from office/VPN only"
+  }
+
+  # App traffic only from load balancer security group
+  ingress {
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
+    cidr_blocks = [var.allowed_cidr]
+    description = "App port from allowed network only"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow all outbound"
+  }
+}
+
+# ── RDS — SECURE ──────────────────────────────────────────────
+resource "aws_db_instance" "app_db" {
+  identifier        = "${var.app_name}-db"
+  engine            = "postgres"
+  engine_version    = "15.4"
+  instance_class    = "db.t3.micro"
+  allocated_storage = 20
+  db_name           = "appdb"
+  username          = "admin"
+  # ✅ FIX 5: Password from AWS Secrets Manager, not hardcoded
+  password          = data.aws_secretsmanager_secret_version.db_password.secret_string
+
+  storage_encrypted       = true                    # ✅
+  kms_key_id              = aws_kms_key.app_key.arn
+  backup_retention_period = 7                       # ✅ 7 days
+  deletion_protection     = true                    # ✅
+  skip_final_snapshot     = false                   # ✅
+  publicly_accessible     = false                   # ✅
+
+  vpc_security_group_ids = [aws_security_group.app_sg.id]
+}
+
+data "aws_secretsmanager_secret_version" "db_password" {
+  secret_id = "/${var.app_name}/db/password"
+}
+
+# ── CloudWatch logs — SECURE ──────────────────────────────────
+resource "aws_cloudwatch_log_group" "app_logs" {
+  name              = "/aws/app/${var.app_name}"
+  retention_in_days = 90                          # ✅
+  kms_key_id        = aws_kms_key.app_key.arn    # ✅ Encrypted
+}
